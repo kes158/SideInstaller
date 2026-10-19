@@ -1,0 +1,109 @@
+name: Build unsigned IPA
+
+# Manual only: Actions tab -> "Build unsigned IPA" -> Run workflow.
+# Builds the chosen branch (e.g. the one with the Korean files) into an
+# unsigned SideInstaller.ipa, the same way scripts/export-ipa.sh does on a Mac,
+# and attaches it to the run as a downloadable artifact. Nothing is signed and
+# nothing is sent to Apple; sign it afterwards with Feather, SideStore, etc.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build (e.g. add-korean)"
+        required: true
+        default: main
+      bundle_id:
+        description: "Bundle ID of the exported app (the Live Activity extension keeps its .LiveActivity suffix)"
+        required: true
+        default: com.frizzlem.sideinstaller
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Preview image with Xcode 27 (the app's own toolchain, per NOTES.md).
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+    steps:
+      - name: Check out the chosen ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          rustc --version
+          cargo --version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Add Rust iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Build the Rust library
+        run: DEVELOPER_DIR="$(xcode-select -p)" ./build-rust.sh
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Set the bundle id
+        run: |
+          set -euo pipefail
+          # project.yml's ids are com.frizzle.sideinstaller and
+          # com.frizzle.sideinstaller.LiveActivity; swapping the shared prefix
+          # keeps the extension's id starting with the app's, which iOS needs.
+          pbx="SideInstaller.xcodeproj/project.pbxproj"
+          grep -q 'com\.frizzle\.sideinstaller' "$pbx"
+          sed -i '' "s/com\.frizzle\.sideinstaller/${BUNDLE_ID}/g" "$pbx"
+          grep -o 'PRODUCT_BUNDLE_IDENTIFIER = [^;]*;' "$pbx" | sort -u
+
+      - name: Build the app (Release, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project SideInstaller.xcodeproj -scheme SideInstaller \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Verify the bundle ids
+        run: |
+          set -euo pipefail
+          app="build/Build/Products/Release-iphoneos/SideInstaller.app"
+          test -d "$app"
+          got="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
+          echo "app: $got"
+          test "$got" = "$BUNDLE_ID"
+          for ext in "$app"/PlugIns/*.appex "$app"/Extensions/*.appex; do
+            [ -d "$ext" ] || continue
+            eid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist")"
+            echo "extension: $eid"
+            case "$eid" in "$BUNDLE_ID".*) ;; *) echo "extension id outside $BUNDLE_ID"; exit 1 ;; esac
+          done
+
+      - name: Package the IPA
+        run: |
+          set -euo pipefail
+          rm -rf stage SideInstaller.ipa
+          mkdir -p stage/Payload
+          ditto "build/Build/Products/Release-iphoneos/SideInstaller.app" "stage/Payload/SideInstaller.app"
+          find stage -name .DS_Store -delete
+          (cd stage && zip -qryX ../SideInstaller.ipa Payload)
+          ls -lh SideInstaller.ipa
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-ipa
+          path: SideInstaller.ipa
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
