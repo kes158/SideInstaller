@@ -17,6 +17,10 @@ on:
         description: "Bundle ID of the exported app (the Live Activity extension keeps its .LiveActivity suffix)"
         required: true
         default: com.frizzlem.sideinstaller
+      version:
+        description: "App version to stamp in (leave blank to use the newest heading in CHANGELOG.md)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -28,6 +32,7 @@ jobs:
     timeout-minutes: 90
     env:
       BUNDLE_ID: ${{ inputs.bundle_id }}
+      VERSION_INPUT: ${{ inputs.version }}
     steps:
       - name: Check out the chosen ref
         uses: actions/checkout@v4
@@ -50,6 +55,22 @@ jobs:
 
       - name: Build the Rust library
         run: DEVELOPER_DIR="$(xcode-select -p)" ./build-rust.sh
+
+      - name: Set the app version
+        run: |
+          set -euo pipefail
+          # project.yml keeps a stale MARKETING_VERSION (0.9.0); the published
+          # IPAs get the real version from the maintainer's local Xcode project.
+          # Without this the app would report 0.9.0 and show "Update available".
+          version="$VERSION_INPUT"
+          if [ -z "$version" ]; then
+            version="$(grep -m1 -oE '^## [0-9]+(\.[0-9]+)+' CHANGELOG.md | cut -d' ' -f2)"
+          fi
+          [ -n "$version" ] || { echo "no version found; pass the version input"; exit 1; }
+          grep -q 'MARKETING_VERSION:' project.yml
+          sed -i '' -E "s/(MARKETING_VERSION: \")[^\"]*(\")/\1${version}\2/" project.yml
+          grep -n 'MARKETING_VERSION' project.yml
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Generate the Xcode project
         run: xcodegen generate
@@ -82,6 +103,9 @@ jobs:
           got="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
           echo "app: $got"
           test "$got" = "$BUNDLE_ID"
+          ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
+          echo "version: $ver"
+          test "$ver" = "$VERSION"
           for ext in "$app"/PlugIns/*.appex "$app"/Extensions/*.appex; do
             [ -d "$ext" ] || continue
             eid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist")"
