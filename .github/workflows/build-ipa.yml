@@ -38,6 +38,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          # The repo tracks ~1.2 GB of signed IPAs and build folders (output/,
+          # output-beta/, build-dd/) that a build never reads. Cone mode also
+          # keeps the root files (project.yml, build-rust.sh, CHANGELOG.md).
+          sparse-checkout: |
+            ios-app
+            ios-live-activity
+            rust-core
 
       - name: Show toolchain
         run: |
@@ -50,11 +57,38 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
-      - name: Add Rust iOS targets
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - name: Add the Rust device target
+        # The simulator slice is only for running in Xcode's simulator; an IPA
+        # for a real iPhone doesn't need it, and skipping it saves ~3.5 minutes.
+        run: rustup target add aarch64-apple-ios
 
-      - name: Build the Rust library
-        run: DEVELOPER_DIR="$(xcode-select -p)" ./build-rust.sh
+      - name: Restore the Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          # Exact key only, on purpose: the next step pins source mtimes so cargo
+          # trusts this cache, which is only safe when rust-core is unchanged.
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/**', 'build-rust.sh') }}
+
+      - name: Build the Rust library (device only)
+        run: |
+          set -euo pipefail
+          # A fresh checkout stamps every file "now", which makes cargo rebuild
+          # the path dependencies in rust-core/vendor even with a warm cache.
+          # A fixed old mtime lets it reuse them; the cache key above changes
+          # whenever any of these files do, so stale output can't be reused.
+          find rust-core -path rust-core/target -prune -o -type f -exec touch -t 200001010000 {} +
+          # build-rust.sh without its simulator lines, so any other change the
+          # maintainer makes to the script (flags, paths) still applies.
+          sed '/aarch64-apple-ios-sim/d' build-rust.sh > build-rust-device.sh
+          bash -n build-rust-device.sh
+          grep -q 'cargo build --release --target aarch64-apple-ios$' build-rust-device.sh
+          chmod +x build-rust-device.sh
+          DEVELOPER_DIR="$(xcode-select -p)" ./build-rust-device.sh
+          rm -f build-rust-device.sh
 
       - name: Set the app version
         run: |
